@@ -654,10 +654,21 @@ NAVBAR_HTML = """
     </div>
   </div>
   <div id="nav-links">
-    <button class="nav-btn active">🏠 Home</button>
-    <button class="nav-btn">🔬 Analyze</button>
-    <button class="nav-btn">📊 Dashboard</button>
-    <button class="nav-btn">ℹ️ About</button>
+    <a href="app.py">
+      <button class="nav-btn active">🏠 Home</button>
+    </a>
+
+    <a href="analyze.py">
+        <button class="nav-btn">🔬 Analyze</button>
+    </a>
+
+    <a href="dashboard.py">
+        <button class="nav-btn">📊 Dashboard</button>
+    </a>
+
+    <a href="about.py">
+        <button class="nav-btn">ℹ️ About</button>
+    </a>
   </div>
 </div>
 """
