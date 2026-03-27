@@ -1,1676 +1,1040 @@
-# dashboard.py (fixed)
-import json
+"""
+dashboard.py — PhytoScan AI · Full Analytics Dashboard
+Complete standalone dashboard with nav bar, footer, and rich visualizations
+Matches the UI style of app.py
+"""
+
 import os
 import pickle
-import string
-from collections import Counter
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+import numpy as np
 
 import gradio as gr
 import plotly.graph_objects as go
+import plotly.express as px
 
-# Shared history file
+# ─── Configuration ───────────────────────────────────────────────────────────
 HISTORY_FILE = "scan_history.pkl"
 
-
+# ─── Helper Functions ─────────────────────────────────────────────────────────
 def load_scans():
+    """Load scan history from pickle file"""
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "rb") as f:
-                return pickle.load(f)
-        except:
+                data = pickle.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
             return []
     return []
 
+def extract_crop_from_image(path: str) -> str:
+    """Extract crop name from image filename"""
+    if not path:
+        return "Plant"
+    name = os.path.basename(path).lower()
+    crops = ["tomato", "potato", "corn", "wheat", "rice", "pepper",
+             "mango", "grape", "apple", "banana", "brinjal", "onion"]
+    for crop in crops:
+        if crop in name:
+            return crop.capitalize()
+    return "Plant"
 
-def generate_dashboard_html():
-    scans = load_scans()
+def get_crop_emoji(crop: str) -> str:
+    """Get emoji for crop type"""
+    emoji_map = {
+        "Tomato": "🍅", "Potato": "🥔", "Corn": "🌽", "Wheat": "🌾",
+        "Rice": "🍚", "Pepper": "🫑", "Mango": "🥭", "Grape": "🍇",
+        "Apple": "🍎", "Banana": "🍌", "Brinjal": "🍆", "Onion": "🧅"
+    }
+    return emoji_map.get(crop, "🌱")
 
-    # Convert scans to list for display
-    scan_list = []
-    for i, s in enumerate(scans):
-        scan_list.append(
-            {
-                "id": i + 1,
-                "date": s.get("date", "Unknown"),
-                "crop": extract_crop_from_image(s.get("image", "")),
-                "disease": s.get("disease", "Unknown"),
-                "severity": s.get("severity", "Unknown"),
-                "confidence": 85,  # placeholder, could be stored if we had it
-                "action": generate_action(s.get("disease", ""), s.get("severity", "")),
-            }
-        )
+def get_severity_color(severity: str) -> str:
+    """Get color for severity level"""
+    colors = {
+        "High": "#e74c3c",
+        "Medium": "#f39c12", 
+        "Low": "#27ae60",
+        "None": "#3498db"
+    }
+    return colors.get(severity, "#95a5a6")
 
-    # Stats
-    total_scans = len(scan_list)
-    diseases = [s["disease"] for s in scan_list if s["disease"].lower() != "healthy"]
-    unique_diseases = len(set(diseases))
-    healthy_scans = sum(1 for s in scan_list if s["disease"].lower() == "healthy")
-    severity_counts = Counter(s["severity"] for s in scan_list)
+def get_severity_icon(severity: str) -> str:
+    """Get icon for severity level"""
+    icons = {
+        "High": "🔴",
+        "Medium": "🟡",
+        "Low": "🟢",
+        "None": "⚪"
+    }
+    return icons.get(severity, "❓")
 
-    # Crops
-    crop_names = list(set(s["crop"] for s in scan_list))
-    crops = []
-    for crop in crop_names:
-        crop_scans = [s for s in scan_list if s["crop"] == crop]
-        latest = crop_scans[-1] if crop_scans else None
-        health = 100 if latest and latest["disease"].lower() == "healthy" else 70
-        status = "Good" if health >= 80 else "Warning" if health >= 60 else "Critical"
-        crops.append(
-            {
-                "name": crop,
-                "variety": "Unknown",
-                "emoji": get_crop_emoji(crop),
-                "health": health,
-                "planted": "Unknown",
-                "area": "Unknown",
-                "nextAction": "Schedule scan",
-                "scans": len(crop_scans),
-                "status": status,
-            }
-        )
+def parse_date(date_str):
+    """Parse date string to datetime object"""
+    try:
+        return datetime.strptime(date_str, "%b %d, %Y %H:%M")
+    except:
+        return datetime.now()
 
-    # Alerts
-    alerts = generate_alerts(scan_list)
+def process_scan_data(scans):
+    """Process raw scan data into structured format"""
+    processed = []
+    for idx, scan in enumerate(scans):
+        crop = scan.get("crop") or extract_crop_from_image(scan.get("image", ""))
+        disease = scan.get("disease", "Unknown")
+        severity = scan.get("severity", "Unknown")
+        
+        confidence = scan.get("confidence", 85)
+        
+        processed.append({
+            "id": idx + 1,
+            "date": scan.get("date", "Unknown"),
+            "datetime": parse_date(scan.get("date", "")),
+            "crop": crop,
+            "disease": disease,
+            "severity": severity,
+            "confidence": confidence,
+            "cause": scan.get("cause", "Unknown"),
+            "is_healthy": "healthy" in disease.lower(),
+            "image_path": scan.get("image", ""),
+        })
+    return processed
 
-    # Notes
-    notes = []
-    for s in scan_list:
-        if s["severity"] in ["High", "Medium"]:
-            notes.append(
-                {
-                    "crop": s["crop"],
-                    "date": s["date"],
-                    "text": f"Detected {s['disease']} (severity: {s['severity']}). {s['action']}",
-                }
-            )
+def get_stats(processed_scans):
+    """Calculate statistics from processed scans"""
+    total = len(processed_scans)
+    healthy = sum(1 for s in processed_scans if s["is_healthy"])
+    diseased = total - healthy
+    
+    severity_counts = Counter(s["severity"] for s in processed_scans)
+    disease_counts = Counter(s["disease"] for s in processed_scans if not s["is_healthy"])
+    crop_counts = Counter(s["crop"] for s in processed_scans)
+    
+    # Calculate average health score
+    health_scores = []
+    for s in processed_scans:
+        if s["is_healthy"]:
+            health_scores.append(95)
+        else:
+            score_map = {"High": 40, "Medium": 65, "Low": 80, "None": 95}
+            health_scores.append(score_map.get(s["severity"], 70))
+    
+    avg_health = int(np.mean(health_scores)) if health_scores else 85
+    
+    return {
+        "total_scans": total,
+        "healthy_scans": healthy,
+        "diseased_scans": diseased,
+        "unique_diseases": len(disease_counts),
+        "unique_crops": len(crop_counts),
+        "severity_counts": severity_counts,
+        "disease_counts": disease_counts,
+        "crop_counts": crop_counts,
+        "avg_health": avg_health,
+        "critical_count": severity_counts.get("High", 0),
+        "warning_count": severity_counts.get("Medium", 0),
+    }
 
-    # Compute health trend (simulated)
-    health_trend = compute_health_trend(scan_list)
-
-    # Disease breakdown
-    disease_counts = Counter(
-        s["disease"] for s in scan_list if s["disease"].lower() != "healthy"
+# ─── Chart Creation Functions ─────────────────────────────────────────────────
+def create_health_trend_chart(processed_scans):
+    """Create health trend over time chart"""
+    if not processed_scans:
+        dates = [(datetime.now() - timedelta(days=i)).strftime("%b %d") for i in range(7, -1, -1)]
+        values = [70, 72, 75, 78, 80, 82, 85, 87]
+    else:
+        sorted_scans = sorted(processed_scans, key=lambda x: x["datetime"])
+        recent_scans = sorted_scans[-12:]
+        
+        dates = []
+        values = []
+        for scan in recent_scans:
+            dates.append(scan["date"].split()[0] if " " in scan["date"] else scan["date"])
+            if scan["is_healthy"]:
+                score = 95
+            else:
+                score_map = {"High": 40, "Medium": 65, "Low": 80, "None": 95}
+                score = score_map.get(scan["severity"], 70)
+            values.append(score)
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates,
+        y=values,
+        mode="lines+markers",
+        line=dict(color="#2d6a4f", width=3),
+        marker=dict(size=8, color="#40916c", symbol="circle"),
+        fill="tozeroy",
+        fillcolor="rgba(45,106,79,0.1)",
+        hovertemplate="Date: %{x}<br>Health Score: %{y}<extra></extra>"
+    ))
+    
+    fig.update_layout(
+        title=dict(text="Health Score Trend", font=dict(size=14, color="#1b4332", family="Space Grotesk")),
+        xaxis_title="Scan Date",
+        yaxis_title="Health Score (%)",
+        yaxis_range=[0, 100],
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280,
+        margin=dict(l=40, r=40, t=50, b=40),
+        font=dict(family="Nunito")
     )
+    
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#e9ecef")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#e9ecef")
+    
+    return fig
 
-    # Frequency
-    freq_data = compute_frequency(scan_list)
+def create_disease_pie_chart(disease_counts):
+    """Create pie chart for disease distribution"""
+    if not disease_counts:
+        disease_counts = {"No Data": 1}
+    
+    sorted_diseases = sorted(disease_counts.items(), key=lambda x: x[1], reverse=True)[:6]
+    labels = [d[0] for d in sorted_diseases]
+    values = [d[1] for d in sorted_diseases]
+    
+    colors = ["#e74c3c", "#f39c12", "#27ae60", "#3498db", "#9b59b6", "#1abc9c"]
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.4,
+        marker=dict(colors=colors[:len(labels)], line=dict(color="white", width=2)),
+        textinfo="label+percent",
+        textfont=dict(size=11),
+        hoverinfo="label+value+percent",
+    )])
+    
+    fig.update_layout(
+        title=dict(text="Disease Distribution", font=dict(size=14, color="#1b4332", family="Space Grotesk")),
+        showlegend=True,
+        legend=dict(orientation="v", x=1.02, y=0.5, font=dict(size=10)),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280,
+        margin=dict(l=20, r=100, t=50, b=20)
+    )
+    
+    return fig
 
-    # Timeline
-    progress_timeline = compute_progress_timeline(scan_list)
+def create_severity_bar_chart(severity_counts):
+    """Create bar chart for severity distribution"""
+    if not severity_counts:
+        severity_counts = {"None": 0, "Low": 0, "Medium": 0, "High": 0}
+    
+    severity_order = ["None", "Low", "Medium", "High"]
+    colors = ["#3498db", "#27ae60", "#f39c12", "#e74c3c"]
+    
+    x = [s for s in severity_order]
+    y = [severity_counts.get(s, 0) for s in severity_order]
+    
+    fig = go.Figure(data=[go.Bar(
+        x=x,
+        y=y,
+        marker=dict(color=colors, line=dict(color="white", width=2)),
+        text=y,
+        textposition="auto",
+        hovertemplate="Severity: %{x}<br>Count: %{y}<extra></extra>"
+    )])
+    
+    fig.update_layout(
+        title=dict(text="Severity Distribution", font=dict(size=14, color="#1b4332", family="Space Grotesk")),
+        xaxis_title="Severity Level",
+        yaxis_title="Number of Cases",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280,
+        margin=dict(l=40, r=40, t=50, b=40)
+    )
+    
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#e9ecef")
+    
+    return fig
 
-    # Radar data
-    radar_data = compute_radar_data(scan_list, crops)
+def create_activity_timeline(processed_scans):
+    """Create timeline of scan activity"""
+    if not processed_scans:
+        dates = [(datetime.now() - timedelta(days=i)).strftime("%b %d") for i in range(6, -1, -1)]
+        counts = [0, 0, 0, 0, 0, 0, 0]
+    else:
+        # Group by date
+        date_groups = defaultdict(int)
+        for scan in processed_scans:
+            date_key = scan["date"].split()[0] if " " in scan["date"] else scan["date"]
+            date_groups[date_key] += 1
+        
+        # Get last 7 days
+        dates = []
+        counts = []
+        for i in range(6, -1, -1):
+            date = (datetime.now() - timedelta(days=i)).strftime("%b %d")
+            dates.append(date)
+            counts.append(date_groups.get(date, 0))
+    
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=dates,
+        y=counts,
+        marker=dict(color="#2d6a4f", line=dict(color="white", width=1)),
+        text=counts,
+        textposition="auto",
+        hovertemplate="Date: %{x}<br>Scans: %{y}<extra></extra>"
+    ))
+    
+    fig.update_layout(
+        title=dict(text="Scan Activity (Last 7 Days)", font=dict(size=14, color="#1b4332", family="Space Grotesk")),
+        xaxis_title="Date",
+        yaxis_title="Number of Scans",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280,
+        margin=dict(l=40, r=40, t=50, b=40)
+    )
+    
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#e9ecef")
+    
+    return fig
 
-    # Crop progress
-    crop_progress = compute_crop_progress(scan_list, crops)
+def create_crop_health_gauge(avg_health):
+    """Create gauge chart for overall crop health"""
+    # Determine color based on health
+    if avg_health >= 80:
+        color = "#27ae60"
+        status = "Excellent"
+    elif avg_health >= 60:
+        color = "#f39c12"
+        status = "Good"
+    elif avg_health >= 40:
+        color = "#e67e22"
+        status = "Fair"
+    else:
+        color = "#e74c3c"
+        status = "Poor"
+    
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=avg_health,
+        title=dict(text="Overall Crop Health", font=dict(size=14, color="#1b4332")),
+        number=dict(suffix="%", font=dict(size=24, color=color)),
+        gauge=dict(
+            axis=dict(range=[0, 100], tickwidth=1, tickcolor="#95a5a6"),
+            bar=dict(color=color),
+            bgcolor="white",
+            borderwidth=2,
+            bordercolor="#e9ecef",
+            steps=[
+                {"range": [0, 40], "color": "rgba(231, 76, 60, 0.2)"},
+                {"range": [40, 60], "color": "rgba(230, 126, 34, 0.2)"},
+                {"range": [60, 80], "color": "rgba(243, 156, 18, 0.2)"},
+                {"range": [80, 100], "color": "rgba(39, 174, 96, 0.2)"}
+            ]
+        )
+    ))
+    
+    fig.update_layout(
+        height=250,
+        margin=dict(l=40, r=40, t=50, b=20),
+        paper_bgcolor="white"
+    )
+    
+    return fig
 
-    # Soil gauges (static)
-    soil_gauges = [
-        {
-            "icon": "🌡️",
-            "name": "Soil Temp",
-            "val": "24°C",
-            "pct": 62,
-            "color": "#e74c3c",
-        },
-        {"icon": "💧", "name": "Moisture", "val": "68%", "pct": 68, "color": "#3498db"},
-        {"icon": "⚗️", "name": "pH Level", "val": "6.4", "pct": 64, "color": "#9b59b6"},
-        {
-            "icon": "🧪",
-            "name": "Nitrogen",
-            "val": "High",
-            "pct": 82,
-            "color": "#27ae60",
-        },
-        {
-            "icon": "🔬",
-            "name": "Phosphorus",
-            "val": "Medium",
-            "pct": 54,
-            "color": "#f39c12",
-        },
-        {
-            "icon": "⚡",
-            "name": "Potassium",
-            "val": "Low",
-            "pct": 30,
-            "color": "#e74c3c",
-        },
-    ]
-
-    return "<html><body><h1>PhytoScan AI Dashboard</h1><p>Total scans: {}</p></body></html>".format(len(scan_list))
-
-    # Create Plotly charts
-    health_chart = create_health_chart(health_trend)
-    disease_chart = create_disease_chart(disease_counts)
-    freq_chart = create_freq_chart(freq_data)
-    progress_chart = create_progress_chart(progress_timeline)
-    radar_chart = create_radar_chart(radar_data)
-    forecast_chart = create_forecast_chart()
-    journal_chart = create_journal_chart(notes)
-
-    # Convert Plotly figures to HTML (with CDN for plotly.js)
+# ─── HTML Components ─────────────────────────────────────────────────────────
+def build_dashboard_html():
+    """Generate complete dashboard HTML"""
+    # Load and process data
+    raw_scans = load_scans()
+    processed_scans = process_scan_data(raw_scans)
+    stats = get_stats(processed_scans)
+    
+    # Create charts
+    health_chart = create_health_trend_chart(processed_scans)
+    disease_chart = create_disease_pie_chart(stats["disease_counts"])
+    severity_chart = create_severity_bar_chart(stats["severity_counts"])
+    activity_chart = create_activity_timeline(processed_scans)
+    gauge_chart = create_crop_health_gauge(stats["avg_health"])
+    
+    # Convert charts to HTML
     health_html = health_chart.to_html(full_html=False, include_plotlyjs="cdn")
     disease_html = disease_chart.to_html(full_html=False, include_plotlyjs=False)
-    freq_html = freq_chart.to_html(full_html=False, include_plotlyjs=False)
-    progress_html = progress_chart.to_html(full_html=False, include_plotlyjs=False)
-    radar_html = radar_chart.to_html(full_html=False, include_plotlyjs=False)
-    forecast_html = forecast_chart.to_html(full_html=False, include_plotlyjs=False)
-    journal_html = journal_chart.to_html(full_html=False, include_plotlyjs=False)
-
-    # Prepare JSON data for JavaScript
-    scan_list_json = json.dumps(scan_list)
-    crops_json = json.dumps(crops)
-    alerts_json = json.dumps(alerts)
-    notes_json = json.dumps(notes)
-    soil_gauges_json = json.dumps(soil_gauges)
-    progress_timeline_json = json.dumps(progress_timeline)
-    health_trend_last = int(health_trend[-1]) if health_trend else 70
-
-    # Build the template using string.Template (safe with $placeholders)
-    # The HTML string uses $var for dynamic parts, and all other braces are kept as is.
-    template = string.Template("""
+    severity_html = severity_chart.to_html(full_html=False, include_plotlyjs=False)
+    activity_html = activity_chart.to_html(full_html=False, include_plotlyjs=False)
+    gauge_html = gauge_chart.to_html(full_html=False, include_plotlyjs=False)
+    
+    # Build recent scans table
+    recent_scans_html = ""
+    for scan in processed_scans[:10]:
+        severity_color = get_severity_color(scan["severity"])
+        severity_icon = get_severity_icon(scan["severity"])
+        
+        health_badge = "✅ Healthy" if scan["is_healthy"] else f"{severity_icon} {scan['severity']}"
+        badge_color = "#27ae60" if scan["is_healthy"] else severity_color
+        
+        recent_scans_html += f"""
+        <tr style="border-bottom:1px solid #e9ecef;">
+            <td style="padding:12px;color:#495057;">{scan["date"]}</td>
+            <td style="padding:12px;"><strong>{scan["crop"]}</strong></td>
+            <td style="padding:12px;">{scan["disease"]}</td>
+            <td style="padding:12px;">
+                <span style="background:{badge_color}20;color:{badge_color};padding:4px 8px;border-radius:12px;font-size:11px;font-weight:600;">
+                    {health_badge}
+                </span>
+            </td>
+            <td style="padding:12px;">
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <div style="flex:1;background:#e9ecef;border-radius:4px;height:4px;max-width:60px;">
+                        <div style="background:{severity_color};width:{scan["confidence"]}%;height:100%;border-radius:4px;"></div>
+                    </div>
+                    <span style="font-size:11px;color:#495057;">{scan["confidence"]}%</span>
+                </div>
+            </td>
+        </tr>"""
+    
+    if not recent_scans_html:
+        recent_scans_html = '<tr><td colspan="5" style="padding:40px;text-align:center;color:#6c757d;">No scans yet. Start analyzing plants to see history!</td></tr>'
+    
+    # Build crop cards
+    crop_cards_html = ""
+    for crop, count in stats["crop_counts"].most_common(6):
+        emoji = get_crop_emoji(crop)
+        # Find last scan date
+        crop_scans = [s for s in processed_scans if s["crop"] == crop]
+        last_scan = crop_scans[0]["date"] if crop_scans else "Never"
+        
+        # Determine health status
+        if crop_scans:
+            if crop_scans[0]["is_healthy"]:
+                status_color = "#27ae60"
+                status_text = "Healthy"
+                status_icon = "✅"
+            elif crop_scans[0]["severity"] == "High":
+                status_color = "#e74c3c"
+                status_text = "Critical"
+                status_icon = "🔴"
+            elif crop_scans[0]["severity"] == "Medium":
+                status_color = "#f39c12"
+                status_text = "Warning"
+                status_icon = "⚠️"
+            else:
+                status_color = "#27ae60"
+                status_text = "Good"
+                status_icon = "✅"
+        else:
+            status_color = "#95a5a6"
+            status_text = "Unknown"
+            status_icon = "❓"
+        
+        crop_cards_html += f"""
+        <div style="background:white;border-radius:12px;border:1px solid #e9ecef;overflow:hidden;">
+            <div style="background:linear-gradient(135deg, #1b4332, #2d6a4f);padding:16px;color:white;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div style="font-size:32px;margin-bottom:4px;">{emoji}</div>
+                        <div style="font-size:18px;font-weight:700;">{crop}</div>
+                    </div>
+                    <div style="background:{status_color};padding:4px 12px;border-radius:20px;font-size:11px;font-weight:600;">
+                        {status_icon} {status_text}
+                    </div>
+                </div>
+            </div>
+            <div style="padding:16px;">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+                    <div>
+                        <div style="font-size:11px;color:#6c757d;margin-bottom:4px;">Total Scans</div>
+                        <div style="font-size:20px;font-weight:700;color:#1b4332;">{count}</div>
+                    </div>
+                    <div>
+                        <div style="font-size:11px;color:#6c757d;margin-bottom:4px;">Last Scan</div>
+                        <div style="font-size:11px;color:#495057;">{last_scan}</div>
+                    </div>
+                </div>
+            </div>
+        </div>"""
+    
+    # Build alerts
+    alerts_html = ""
+    high_alerts = [s for s in processed_scans if s["severity"] == "High"][:3]
+    for alert in high_alerts:
+        alerts_html += f"""
+        <div style="background:#fde8e8;border-left:4px solid #e74c3c;border-radius:8px;padding:12px;margin-bottom:12px;">
+            <div style="display:flex;align-items:flex-start;gap:10px;">
+                <div style="font-size:20px;">🚨</div>
+                <div style="flex:1;">
+                    <div style="font-weight:700;color:#1b4332;margin-bottom:4px;">Critical: {alert['disease']}</div>
+                    <div style="font-size:12px;color:#6c757d;margin-bottom:6px;">Detected in {alert['crop']} - Immediate action required</div>
+                    <div style="font-size:11px;color:#e74c3c;">{alert['date']}</div>
+                </div>
+            </div>
+        </div>"""
+    
+    if not high_alerts:
+        alerts_html = """
+        <div style="background:#d4edda;border-left:4px solid #27ae60;border-radius:8px;padding:12px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+                <div style="font-size:20px;">✅</div>
+                <div>
+                    <div style="font-weight:700;color:#1b4332;">No Critical Issues</div>
+                    <div style="font-size:12px;color:#6c757d;">All crops are in good health. Keep monitoring regularly.</div>
+                </div>
+            </div>
+        </div>"""
+    
+    # Generate complete HTML with navbar and footer
+    html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>PhytoScan AI — Crop Dashboard</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=Playfair+Display:wght@700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
-<style>
-/* ========== CSS from original dashboard.html ========== */
-:root {
-  --forest:   #1a3a2a;
-  --pine:     #2d5a3d;
-  --fern:     #3d7a52;
-  --sage:     #52a06e;
-  --mint:     #7ec8a0;
-  --fog:      #d4edd9;
-  --cream:    #f5f9f5;
-  --paper:    #ffffff;
-  --ink:      #0f1f16;
-  --muted:    #6b8a74;
-  --border:   #e2ede5;
-  --danger:   #c0392b;
-  --warning:  #d68910;
-  --success:  #1e8449;
-  --info:     #1a5276;
-  --radius:   16px;
-  --shadow:   0 4px 24px rgba(26,58,42,0.10);
-  --shadow-lg:0 12px 48px rgba(26,58,42,0.16);
-  --sidebar-w:260px;
-  --topbar-h: 64px;
-}
-
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-body {
-  font-family: 'DM Sans', sans-serif;
-  background: var(--cream);
-  color: var(--ink);
-  min-height: 100vh;
-  overflow-x: hidden;
-}
-
-/* Sidebar */
-#sidebar {
-  position: fixed; top: 0; left: 0;
-  width: var(--sidebar-w);
-  height: 100vh;
-  background: linear-gradient(180deg, var(--forest) 0%, #0f2318 100%);
-  display: flex; flex-direction: column;
-  z-index: 200;
-  transition: transform 0.35s cubic-bezier(.77,0,.18,1);
-  overflow-y: auto;
-}
-
-.sidebar-logo {
-  padding: 28px 24px 20px;
-  border-bottom: 1px solid rgba(255,255,255,0.07);
-}
-.logo-icon {
-  width: 44px; height: 44px;
-  background: linear-gradient(135deg, var(--fern), var(--sage));
-  border-radius: 12px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 22px; margin-bottom: 10px;
-  box-shadow: 0 4px 12px rgba(61,122,82,0.4);
-}
-.logo-name {
-  font-family: 'Playfair Display', serif;
-  font-size: 18px; font-weight: 900;
-  color: #fff; letter-spacing: -0.5px;
-}
-.logo-sub {
-  font-size: 10px; color: rgba(255,255,255,0.4);
-  text-transform: uppercase; letter-spacing: 2px; margin-top: 2px;
-}
-
-.sidebar-section {
-  padding: 20px 16px 8px;
-  font-size: 9px; font-weight: 700;
-  color: rgba(255,255,255,0.25);
-  text-transform: uppercase; letter-spacing: 2.5px;
-}
-
-.nav-item {
-  display: flex; align-items: center; gap: 12px;
-  padding: 11px 20px; margin: 2px 10px;
-  border-radius: 10px;
-  color: rgba(255,255,255,0.55);
-  font-size: 14px; font-weight: 500;
-  cursor: pointer; transition: all 0.2s;
-  text-decoration: none;
-}
-.nav-item:hover { background: rgba(255,255,255,0.07); color: #fff; }
-.nav-item.active {
-  background: linear-gradient(135deg, var(--fern), var(--sage));
-  color: #fff;
-  box-shadow: 0 4px 12px rgba(61,122,82,0.35);
-}
-.nav-icon { font-size: 16px; width: 20px; text-align: center; }
-.nav-badge {
-  margin-left: auto;
-  background: var(--danger);
-  color: #fff; font-size: 10px; font-weight: 700;
-  padding: 2px 7px; border-radius: 10px;
-}
-
-.sidebar-footer {
-  margin-top: auto;
-  padding: 20px 16px;
-  border-top: 1px solid rgba(255,255,255,0.07);
-}
-.user-card {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px; border-radius: 10px;
-  background: rgba(255,255,255,0.06); cursor: pointer;
-}
-.user-avatar {
-  width: 36px; height: 36px; border-radius: 10px;
-  background: linear-gradient(135deg, var(--sage), var(--mint));
-  display: flex; align-items: center; justify-content: center;
-  font-size: 16px; flex-shrink: 0;
-}
-.user-name { font-size: 13px; font-weight: 600; color: #fff; }
-.user-role { font-size: 11px; color: rgba(255,255,255,0.4); margin-top: 1px; }
-
-/* Topbar */
-#topbar {
-  position: fixed; top: 0; left: var(--sidebar-w); right: 0;
-  height: var(--topbar-h);
-  background: rgba(245,249,245,0.95);
-  backdrop-filter: blur(12px);
-  border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 0 28px;
-  z-index: 100;
-  transition: left 0.35s cubic-bezier(.77,0,.18,1);
-}
-
-.topbar-left { display: flex; align-items: center; gap: 16px; }
-.page-title {
-  font-family: 'Playfair Display', serif;
-  font-size: 20px; font-weight: 700; color: var(--forest);
-}
-.page-breadcrumb { font-size: 12px; color: var(--muted); }
-
-.topbar-right { display: flex; align-items: center; gap: 12px; }
-
-.top-btn {
-  background: var(--paper); border: 1px solid var(--border);
-  border-radius: 10px; padding: 8px 14px;
-  font-size: 13px; font-weight: 500; color: var(--ink);
-  cursor: pointer; display: flex; align-items: center; gap: 6px;
-  transition: all 0.2s; font-family: 'DM Sans', sans-serif;
-}
-.top-btn:hover { background: var(--fog); border-color: var(--mint); }
-.top-btn.primary {
-  background: linear-gradient(135deg, var(--fern), var(--sage));
-  border-color: transparent; color: #fff;
-  box-shadow: 0 4px 12px rgba(61,122,82,0.3);
-}
-.top-btn.primary:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(61,122,82,0.4); }
-
-#menu-toggle {
-  display: none;
-  background: none; border: none; font-size: 22px; cursor: pointer; color: var(--forest);
-}
-
-/* Main Content */
-#main {
-  margin-left: var(--sidebar-w);
-  margin-top: var(--topbar-h);
-  padding: 32px 28px;
-  min-height: calc(100vh - var(--topbar-h));
-  transition: margin-left 0.35s cubic-bezier(.77,0,.18,1);
-}
-
-/* Tab System */
-.tab-bar {
-  display: flex; gap: 4px; margin-bottom: 28px;
-  background: var(--paper); border-radius: 12px; padding: 4px;
-  border: 1px solid var(--border);
-  overflow-x: auto;
-  box-shadow: var(--shadow);
-  flex-wrap: nowrap;
-}
-.tab-btn {
-  padding: 9px 18px; border-radius: 9px;
-  border: none; background: transparent;
-  font-family: 'DM Sans', sans-serif;
-  font-size: 13px; font-weight: 500; color: var(--muted);
-  cursor: pointer; white-space: nowrap; transition: all 0.2s;
-  display: flex; align-items: center; gap: 6px;
-}
-.tab-btn:hover { color: var(--forest); background: var(--fog); }
-.tab-btn.active {
-  background: linear-gradient(135deg, var(--fern), var(--sage));
-  color: #fff; font-weight: 600;
-  box-shadow: 0 3px 10px rgba(61,122,82,0.3);
-}
-
-.tab-panel { display: none; animation: fadeIn 0.3s ease; }
-.tab-panel.active { display: block; }
-
-@keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
-
-/* Cards & Grids */
-.grid-4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 16px; margin-bottom: 24px; }
-.grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 20px; margin-bottom: 24px; }
-.grid-2 { display: grid; grid-template-columns: repeat(2,1fr); gap: 20px; margin-bottom: 24px; }
-.grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 24px; }
-.grid-1-2 { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; margin-bottom: 24px; }
-
-.card {
-  background: var(--paper); border-radius: var(--radius);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow);
-  overflow: hidden;
-  transition: box-shadow 0.2s, transform 0.2s;
-}
-.card:hover { box-shadow: var(--shadow-lg); transform: translateY(-2px); }
-.card-header {
-  padding: 20px 22px 0;
-  display: flex; align-items: center; justify-content: space-between;
-}
-.card-title {
-  font-size: 13px; font-weight: 700;
-  text-transform: uppercase; letter-spacing: 1.2px;
-  color: var(--muted);
-}
-.card-body { padding: 16px 22px 22px; }
-.card-action {
-  font-size: 11px; color: var(--sage); font-weight: 600;
-  cursor: pointer; text-decoration: none;
-  display: flex; align-items: center; gap: 4px;
-}
-.card-action:hover { color: var(--fern); }
-
-/* Stat Cards */
-.stat-card {
-  background: var(--paper); border-radius: var(--radius);
-  border: 1px solid var(--border);
-  padding: 22px;
-  box-shadow: var(--shadow);
-  transition: all 0.25s;
-  position: relative; overflow: hidden;
-}
-.stat-card::before {
-  content: '';
-  position: absolute; top: 0; left: 0; right: 0; height: 3px;
-}
-.stat-card.green::before  { background: linear-gradient(90deg, var(--fern), var(--mint)); }
-.stat-card.red::before    { background: linear-gradient(90deg, #e74c3c, #f1948a); }
-.stat-card.yellow::before { background: linear-gradient(90deg, #d68910, #f4d03f); }
-.stat-card.blue::before   { background: linear-gradient(90deg, #1a5276, #2e86c1); }
-
-.stat-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-lg); }
-.stat-icon {
-  width: 46px; height: 46px; border-radius: 12px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 22px; margin-bottom: 14px;
-}
-.stat-icon.green  { background: rgba(61,122,82,0.12); }
-.stat-icon.red    { background: rgba(192,57,43,0.10); }
-.stat-icon.yellow { background: rgba(214,137,16,0.10); }
-.stat-icon.blue   { background: rgba(26,82,118,0.10); }
-
-.stat-val {
-  font-family: 'Playfair Display', serif;
-  font-size: 32px; font-weight: 900; line-height: 1;
-  color: var(--forest); margin-bottom: 4px;
-}
-.stat-label { font-size: 13px; color: var(--muted); font-weight: 500; }
-.stat-delta {
-  margin-top: 10px; font-size: 12px; font-weight: 600;
-  display: flex; align-items: center; gap: 4px;
-}
-.stat-delta.up   { color: var(--success); }
-.stat-delta.down { color: var(--danger); }
-.stat-delta.flat { color: var(--muted); }
-
-/* Health Ring */
-.health-ring-wrap {
-  display: flex; flex-direction: column; align-items: center;
-  padding: 24px 16px;
-}
-.ring-container { position: relative; width: 160px; height: 160px; }
-.ring-svg { transform: rotate(-90deg); }
-.ring-bg { fill: none; stroke: var(--fog); stroke-width: 14; }
-.ring-fg { fill: none; stroke-width: 14; stroke-linecap: round;
-  transition: stroke-dashoffset 1.2s cubic-bezier(.4,0,.2,1); }
-.ring-center {
-  position: absolute; inset: 0;
-  display: flex; flex-direction: column;
-  align-items: center; justify-content: center;
-}
-.ring-score {
-  font-family: 'Playfair Display', serif;
-  font-size: 36px; font-weight: 900; color: var(--forest);
-}
-.ring-label { font-size: 11px; color: var(--muted); font-weight: 600; letter-spacing: 1px; }
-.health-legend {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; width: 100%; margin-top: 16px;
-}
-.legend-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px; border-radius: 8px; background: var(--cream);
-}
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.legend-label { font-size: 11px; color: var(--muted); }
-.legend-val { font-size: 13px; font-weight: 700; color: var(--ink); margin-left: auto; }
-
-/* Scan Table */
-.scan-table { width: 100%; border-collapse: collapse; }
-.scan-table th {
-  text-align: left; padding: 10px 14px;
-  font-size: 10px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 1.2px; color: var(--muted);
-  border-bottom: 2px solid var(--border);
-}
-.scan-table td {
-  padding: 13px 14px; font-size: 13px; color: var(--ink);
-  border-bottom: 1px solid var(--border); vertical-align: middle;
-}
-.scan-table tr:last-child td { border-bottom: none; }
-.scan-table tr:hover td { background: var(--cream); }
-
-.disease-tag {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700;
-}
-.tag-danger  { background: #fde8e8; color: var(--danger); }
-.tag-warning { background: #fef3cd; color: var(--warning); }
-.tag-success { background: #d4edda; color: var(--success); }
-.tag-info    { background: #cce5ff; color: var(--info); }
-
-.sev-dot {
-  width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px;
-}
-
-/* Crop Cards */
-.crop-card {
-  background: var(--paper); border-radius: var(--radius);
-  border: 1px solid var(--border); overflow: hidden;
-  box-shadow: var(--shadow); transition: all 0.25s;
-}
-.crop-card:hover { box-shadow: var(--shadow-lg); transform: translateY(-3px); }
-.crop-card-top {
-  padding: 20px;
-  background: linear-gradient(135deg, var(--forest), var(--pine));
-  color: #fff; position: relative; overflow: hidden;
-}
-.crop-card-top::before {
-  content: attr(data-emoji);
-  position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
-  font-size: 52px; opacity: 0.2;
-}
-.crop-name { font-family: 'Playfair Display', serif; font-size: 18px; font-weight: 700; }
-.crop-variety { font-size: 11px; color: rgba(255,255,255,0.55); margin-top: 2px; }
-.crop-health-bar {
-  margin-top: 12px;
-  background: rgba(255,255,255,0.15); border-radius: 4px; height: 6px; overflow: hidden;
-}
-.crop-health-fill { height: 100%; border-radius: 4px; transition: width 1s ease; }
-.crop-card-body { padding: 16px 20px; }
-.crop-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.crop-meta-item { }
-.crop-meta-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
-.crop-meta-val { font-size: 14px; font-weight: 700; color: var(--ink); margin-top: 2px; }
-.crop-actions {
-  display: flex; gap: 8px; padding: 14px 20px;
-  border-top: 1px solid var(--border);
-}
-.crop-btn {
-  flex: 1; padding: 8px; border-radius: 8px; border: 1px solid var(--border);
-  background: var(--cream); font-size: 12px; font-weight: 600;
-  color: var(--muted); cursor: pointer; font-family: 'DM Sans', sans-serif;
-  transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 5px;
-}
-.crop-btn:hover { background: var(--fog); color: var(--forest); border-color: var(--mint); }
-.crop-btn.primary-btn {
-  background: linear-gradient(135deg, var(--fern), var(--sage));
-  color: #fff; border-color: transparent;
-}
-.crop-btn.primary-btn:hover { box-shadow: 0 4px 12px rgba(61,122,82,0.3); }
-
-/* Alerts */
-.alert-item {
-  display: flex; align-items: flex-start; gap: 14px;
-  padding: 14px 16px; border-radius: 10px; margin-bottom: 10px;
-  border: 1px solid transparent;
-}
-.alert-item.urgent   { background: #fdf2f2; border-color: #f5c6cb; }
-.alert-item.warning  { background: #fffdf0; border-color: #ffeeba; }
-.alert-item.info     { background: #f0f6ff; border-color: #b8daff; }
-.alert-item.done     { background: #f0fff4; border-color: #c3e6cb; opacity: 0.7; }
-
-.alert-icon {
-  width: 36px; height: 36px; border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 18px; flex-shrink: 0;
-}
-.urgent .alert-icon   { background: #fde8e8; }
-.warning .alert-icon  { background: #fff3cd; }
-.info .alert-icon     { background: #cce5ff; }
-.done .alert-icon     { background: #d4edda; }
-
-.alert-title { font-size: 13px; font-weight: 700; color: var(--ink); }
-.alert-desc  { font-size: 12px; color: var(--muted); margin-top: 2px; line-height: 1.4; }
-.alert-time  { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
-
-/* Timeline */
-.timeline { position: relative; padding-left: 28px; }
-.timeline::before {
-  content: '';
-  position: absolute; left: 9px; top: 8px; bottom: 8px;
-  width: 2px; background: var(--border);
-}
-.tl-item { position: relative; margin-bottom: 20px; }
-.tl-dot {
-  position: absolute; left: -28px; top: 3px;
-  width: 18px; height: 18px; border-radius: 50%;
-  border: 2px solid var(--paper);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 8px;
-}
-.tl-dot.good    { background: var(--success); }
-.tl-dot.bad     { background: var(--danger); }
-.tl-dot.warn    { background: var(--warning); }
-.tl-dot.neutral { background: var(--info); }
-
-.tl-date { font-size: 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }
-.tl-title { font-size: 13px; font-weight: 700; color: var(--ink); margin-top: 2px; }
-.tl-body  { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
-.tl-tag {
-  display: inline-flex; align-items: center; gap: 4px;
-  margin-top: 6px; padding: 3px 9px; border-radius: 12px;
-  font-size: 10px; font-weight: 700;
-}
-
-/* Weather Widget */
-.weather-main {
-  display: flex; align-items: center; gap: 16px; margin-bottom: 16px;
-}
-.weather-icon { font-size: 52px; }
-.weather-temp {
-  font-family: 'Playfair Display', serif;
-  font-size: 42px; font-weight: 900; color: var(--forest); line-height: 1;
-}
-.weather-desc { font-size: 14px; color: var(--muted); margin-top: 2px; }
-.weather-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
-.weather-cell {
-  background: var(--cream); border-radius: 10px; padding: 10px 12px;
-  text-align: center;
-}
-.weather-cell-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
-.weather-cell-val { font-size: 16px; font-weight: 700; color: var(--ink); margin-top: 3px; }
-
-/* Upload Zone */
-.upload-zone {
-  border: 2px dashed var(--mint); border-radius: var(--radius);
-  padding: 40px 20px; text-align: center;
-  background: linear-gradient(135deg, rgba(82,160,110,0.04), rgba(126,200,160,0.06));
-  cursor: pointer; transition: all 0.2s; position: relative;
-}
-.upload-zone:hover { border-color: var(--fern); background: rgba(61,122,82,0.08); }
-.upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-.upload-icon { font-size: 42px; margin-bottom: 12px; }
-.upload-text { font-size: 15px; font-weight: 700; color: var(--forest); margin-bottom: 4px; }
-.upload-sub { font-size: 12px; color: var(--muted); }
-
-/* Environment Gauges */
-.env-gauge {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 0; border-bottom: 1px solid var(--border);
-}
-.env-gauge:last-child { border-bottom: none; }
-.env-icon { font-size: 22px; width: 36px; text-align: center; }
-.env-info { flex: 1; }
-.env-name { font-size: 12px; font-weight: 600; color: var(--ink); }
-.env-val  { font-size: 11px; color: var(--muted); margin-top: 1px; }
-.env-bar  { flex: 2; }
-.env-track {
-  background: var(--border); border-radius: 4px; height: 6px; overflow: hidden;
-}
-.env-fill { height: 100%; border-radius: 4px; transition: width 1s ease; }
-.env-pct { font-size: 12px; font-weight: 700; color: var(--forest); min-width: 36px; text-align: right; }
-
-/* Notes */
-.note-item {
-  border-radius: 10px; padding: 14px 16px; margin-bottom: 10px;
-  border-left: 3px solid var(--sage);
-  background: var(--cream);
-}
-.note-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-.note-crop { font-size: 12px; font-weight: 700; color: var(--fern); }
-.note-date { font-size: 11px; color: var(--muted); }
-.note-text { font-size: 13px; color: var(--ink); line-height: 1.5; }
-
-.note-input-wrap { margin-top: 16px; }
-.note-textarea {
-  width: 100%; border: 1px solid var(--border); border-radius: 10px;
-  padding: 12px 14px; font-family: 'DM Sans', sans-serif;
-  font-size: 13px; color: var(--ink); resize: none;
-  background: var(--cream); min-height: 80px;
-  transition: border-color 0.2s;
-}
-.note-textarea:focus { outline: none; border-color: var(--sage); background: var(--paper); }
-.note-submit {
-  margin-top: 8px;
-  background: linear-gradient(135deg, var(--fern), var(--sage));
-  color: #fff; border: none; border-radius: 8px;
-  padding: 9px 20px; font-family: 'DM Sans', sans-serif;
-  font-size: 13px; font-weight: 600; cursor: pointer;
-  transition: all 0.2s;
-}
-.note-submit:hover { box-shadow: 0 4px 12px rgba(61,122,82,0.35); transform: translateY(-1px); }
-
-/* Section Label */
-.sec-label {
-  font-family: 'Playfair Display', serif;
-  font-size: 20px; font-weight: 700; color: var(--forest);
-  margin-bottom: 4px;
-}
-.sec-sub { font-size: 13px; color: var(--muted); margin-bottom: 20px; }
-
-/* Responsive */
-@media (max-width: 1100px) {
-  .grid-4 { grid-template-columns: repeat(2,1fr); }
-  .grid-2-1, .grid-1-2 { grid-template-columns: 1fr; }
-}
-@media (max-width: 900px) {
-  :root { --sidebar-w: 0px; }
-  #sidebar { transform: translateX(-260px); width: 260px; }
-  #sidebar.open { transform: translateX(0); }
-  #topbar { left: 0; }
-  #main { margin-left: 0; }
-  #menu-toggle { display: block; }
-  .grid-3 { grid-template-columns: repeat(2,1fr); }
-  .grid-2 { grid-template-columns: 1fr; }
-}
-@media (max-width: 600px) {
-  #main { padding: 20px 14px; }
-  .grid-4, .grid-3 { grid-template-columns: 1fr; }
-  .stat-val { font-size: 26px; }
-  .tab-btn { padding: 8px 12px; font-size: 12px; }
-  .topbar-right .top-btn:not(.primary) { display: none; }
-  .weather-grid { grid-template-columns: repeat(2,1fr); }
-}
-#overlay {
-  display: none; position: fixed; inset: 0;
-  background: rgba(0,0,0,0.4); z-index: 150;
-}
-#overlay.show { display: block; }
-::-webkit-scrollbar { width: 5px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--fog); border-radius: 4px; }
-.anim { animation: slideUp 0.5s ease both; }
-.anim-1 { animation-delay: 0.05s; }
-.anim-2 { animation-delay: 0.10s; }
-.anim-3 { animation-delay: 0.15s; }
-.anim-4 { animation-delay: 0.20s; }
-.anim-5 { animation-delay: 0.25s; }
-@keyframes slideUp {
-  from { opacity:0; transform:translateY(20px); }
-  to   { opacity:1; transform:translateY(0); }
-}
-.chart-wrap { position: relative; width: 100%; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhytoScan AI · Crop Health Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Nunito', sans-serif;
+            background: #f0f4f0;
+            color: #1b4332;
+        }}
+        
+        /* Navbar Styles - Matching app.py */
+        #navbar {{
+            background: linear-gradient(135deg, #1b4332 0%, #2d6a4f 50%, #40916c 100%);
+            padding: 0 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 64px;
+            box-shadow: 0 4px 20px rgba(27,67,50,0.3);
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            flex-wrap: wrap;
+            gap: 10px;
+        }}
+        
+        #nav-brand {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }}
+        
+        #nav-brand-icon {{
+            width: 40px;
+            height: 40px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+        }}
+        
+        #nav-brand-text {{
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 20px;
+            font-weight: 700;
+            color: white;
+            letter-spacing: -0.5px;
+        }}
+        
+        #nav-brand-sub {{
+            font-size: 10px;
+            color: rgba(255,255,255,0.6);
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            margin-top: -4px;
+        }}
+        
+        #nav-links {{
+            display: flex;
+            gap: 6px;
+        }}
+        
+        .nav-btn {{
+            color: rgba(255,255,255,0.85);
+            background: transparent;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-family: 'Nunito', sans-serif;
+            text-decoration: none;
+            display: inline-block;
+        }}
+        
+        .nav-btn:hover, .nav-btn.active {{
+            background: rgba(255,255,255,0.15);
+            color: white;
+        }}
+        
+        /* Hero Section */
+        #hero {{
+            background: linear-gradient(135deg, #1b4332 0%, #2d6a4f 60%, #52b788 100%);
+            padding: 48px 32px;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }}
+        
+        #hero::before {{
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.03'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+        }}
+        
+        #hero-title {{
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: clamp(28px, 5vw, 48px);
+            font-weight: 700;
+            color: white;
+            margin-bottom: 12px;
+            position: relative;
+        }}
+        
+        #hero-sub {{
+            font-size: clamp(13px, 2vw, 16px);
+            color: rgba(255,255,255,0.75);
+            max-width: 560px;
+            margin: 0 auto 28px;
+            line-height: 1.6;
+            position: relative;
+        }}
+        
+        .hero-stats {{
+            display: flex;
+            justify-content: center;
+            gap: 32px;
+            flex-wrap: wrap;
+            position: relative;
+        }}
+        
+        .hero-stat {{
+            text-align: center;
+            color: white;
+        }}
+        
+        .hero-stat-num {{
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 28px;
+            font-weight: 700;
+            line-height: 1;
+        }}
+        
+        .hero-stat-label {{
+            font-size: 11px;
+            color: rgba(255,255,255,0.6);
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-top: 4px;
+        }}
+        
+        /* Main Content */
+        #main-content {{
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 32px 24px;
+        }}
+        
+        .section-title {{
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 22px;
+            font-weight: 700;
+            color: #1b4332;
+            margin-bottom: 6px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .section-sub {{
+            font-size: 13px;
+            color: #888;
+            margin-bottom: 20px;
+        }}
+        
+        .card {{
+            background: white;
+            border-radius: 20px;
+            padding: 20px;
+            box-shadow: 0 2px 16px rgba(0,0,0,0.06);
+            border: 1px solid rgba(0,0,0,0.04);
+            margin-bottom: 24px;
+        }}
+        
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin-bottom: 32px;
+        }}
+        
+        .stat-card {{
+            background: white;
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid #e9ecef;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            transition: all 0.3s;
+        }}
+        
+        .stat-card:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }}
+        
+        .charts-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 24px;
+            margin-bottom: 24px;
+        }}
+        
+        .crops-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 24px;
+        }}
+        
+        .scan-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        .scan-table th {{
+            text-align: left;
+            padding: 12px;
+            background: #f8f9fa;
+            font-size: 12px;
+            font-weight: 700;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            border-bottom: 2px solid #e9ecef;
+        }}
+        
+        .scan-table td {{
+            padding: 12px;
+            font-size: 13px;
+        }}
+        
+        .scan-table tr:hover {{
+            background: #f8f9fa;
+        }}
+        
+        /* Footer - Matching app.py */
+        #footer {{
+            background: linear-gradient(135deg, #0d2818 0%, #1b4332 100%);
+            color: rgba(255,255,255,0.8);
+            padding: 48px 32px 24px;
+            margin-top: 32px;
+        }}
+        
+        .footer-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 32px;
+            max-width: 1200px;
+            margin: 0 auto 32px;
+        }}
+        
+        .footer-brand h3 {{
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 20px;
+            font-weight: 700;
+            color: white;
+            margin: 0 0 8px;
+        }}
+        
+        .footer-brand p {{
+            font-size: 13px;
+            line-height: 1.6;
+            color: rgba(255,255,255,0.5);
+            margin: 0;
+        }}
+        
+        .footer-col h4 {{
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: #52b788;
+            margin: 0 0 14px;
+            font-weight: 700;
+        }}
+        
+        .footer-col ul {{
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }}
+        
+        .footer-col ul li {{
+            font-size: 13px;
+            color: rgba(255,255,255,0.5);
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: color 0.2s;
+        }}
+        
+        .footer-col ul li:hover {{
+            color: #52b788;
+        }}
+        
+        .footer-bottom {{
+            border-top: 1px solid rgba(255,255,255,0.1);
+            padding-top: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            max-width: 1200px;
+            margin: 0 auto;
+            font-size: 12px;
+            color: rgba(255,255,255,0.35);
+        }}
+        
+        .footer-badges {{
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }}
+        
+        .footer-badge {{
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 11px;
+            color: rgba(255,255,255,0.5);
+        }}
+        
+        @media (max-width: 768px) {{
+            #navbar {{
+                padding: 0 16px;
+                height: auto;
+                padding: 12px 16px;
+            }}
+            #hero {{
+                padding: 32px 16px;
+            }}
+            #main-content {{
+                padding: 20px 16px;
+            }}
+            .charts-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+    </style>
 </head>
 <body>
-
-<div id="overlay" onclick="closeSidebar()"></div>
-
-<!-- Sidebar -->
-<nav id="sidebar">
-  <div class="sidebar-logo">
-    <div class="logo-icon">🌿</div>
-    <div class="logo-name">PhytoScan AI</div>
-    <div class="logo-sub">Crop Intelligence</div>
-  </div>
-
-  <div class="sidebar-section">Overview</div>
-  <a class="nav-item active" onclick="showTab('overview', this)">
-    <span class="nav-icon">📊</span> Dashboard
-  </a>
-  <a class="nav-item" onclick="showTab('crops', this)">
-    <span class="nav-icon">🌾</span> My Crops
-    <span class="nav-badge">$len(crops)</span>
-  </a>
-
-  <div class="sidebar-section">Analysis</div>
-  <a class="nav-item" onclick="showTab('scans', this)">
-    <span class="nav-icon">🔬</span> Scan History
-  </a>
-  <a class="nav-item" onclick="showTab('progress', this)">
-    <span class="nav-icon">📈</span> Progress
-  </a>
-  <a class="nav-item" onclick="showTab('alerts', this)">
-    <span class="nav-icon">🚨</span> Alerts
-    <span class="nav-badge">$alert_count</span>
-  </a>
-
-  <div class="sidebar-section">Management</div>
-  <a class="nav-item" onclick="showTab('environment', this)">
-    <span class="nav-icon">🌡️</span> Environment
-  </a>
-  <a class="nav-item" onclick="showTab('journal', this)">
-    <span class="nav-icon">📓</span> Field Journal
-  </a>
-  <a class="nav-item" onclick="showTab('quickscan', this)">
-    <span class="nav-icon">📷</span> Quick Scan
-  </a>
-
-  <div class="sidebar-footer">
-    <div class="user-card">
-      <div class="user-avatar">👨‍🌾</div>
-      <div>
-        <div class="user-name">Farmer Raj</div>
-        <div class="user-role">Premium Plan · Bengaluru</div>
-      </div>
-    </div>
-  </div>
-</nav>
-
-<!-- Topbar -->
-<header id="topbar">
-  <div class="topbar-left">
-    <button id="menu-toggle" onclick="toggleSidebar()">☰</button>
-    <div>
-      <div class="page-title" id="page-title">Dashboard</div>
-      <div class="page-breadcrumb" id="page-breadcrumb">PhytoScan AI / Overview</div>
-    </div>
-  </div>
-  <div class="topbar-right">
-    <button class="top-btn" onclick="exportData()">⬇ Export</button>
-    <button class="top-btn" onclick="showTab('quickscan', null)">📷 Quick Scan</button>
-    <button class="top-btn primary" onclick="showTab('quickscan', null)">＋ New Scan</button>
-  </div>
-</header>
-
-<main id="main">
-
-<!-- Overview Tab -->
-<div class="tab-panel active" id="tab-overview">
-  <div class="grid-4">
-    <div class="stat-card green anim anim-1">
-      <div class="stat-icon green">🌱</div>
-      <div class="stat-val">$total_scans</div>
-      <div class="stat-label">Total Scans</div>
-      <div class="stat-delta up">↑ $total_scans total</div>
-    </div>
-    <div class="stat-card red anim anim-2">
-      <div class="stat-icon red">🦠</div>
-      <div class="stat-val">$unique_diseases</div>
-      <div class="stat-label">Diseases Found</div>
-      <div class="stat-delta down">↓ $unique_diseases_diff vs last month</div>
-    </div>
-    <div class="stat-card yellow anim anim-3">
-      <div class="stat-icon yellow">🌾</div>
-      <div class="stat-val">$len(crops)</div>
-      <div class="stat-label">Active Crops</div>
-      <div class="stat-delta flat">→ No change</div>
-    </div>
-    <div class="stat-card blue anim anim-4">
-      <div class="stat-icon blue">📈</div>
-      <div class="stat-val">$health_trend_last%</div>
-      <div class="stat-label">Avg Health Score</div>
-      <div class="stat-delta up">↑ $health_improvement% improvement</div>
-    </div>
-  </div>
-
-  <div class="grid-2-1 anim anim-2">
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">📊 Health Score Trend</span>
-        <div style="display:flex;gap:6px;">
-          <button class="top-btn" style="padding:5px 10px;font-size:11px;" onclick="setChartPeriod('week')">Week</button>
-          <button class="top-btn" style="padding:5px 10px;font-size:11px;" onclick="setChartPeriod('month')">Month</button>
-          <button class="top-btn" style="padding:5px 10px;font-size:11px;" onclick="setChartPeriod('year')">Year</button>
-        </div>
-      </div>
-      <div class="card-body">
-        <div class="chart-wrap" style="height:220px;">
-          $health_html
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">🥧 Disease Breakdown</span>
-      </div>
-      <div class="card-body">
-        <div class="chart-wrap" style="height:220px;">
-          $disease_html
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid-1-2 anim anim-3">
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">💚 Overall Health</span>
-      </div>
-      <div class="card-body" style="padding-top:8px;">
-        <div class="health-ring-wrap">
-          <div class="ring-container">
-            <svg class="ring-svg" width="160" height="160" viewBox="0 0 160 160">
-              <circle class="ring-bg" cx="80" cy="80" r="66"/>
-              <circle class="ring-fg" id="healthRing" cx="80" cy="80" r="66"
-                stroke="url(#ringGrad)"
-                stroke-dasharray="414.69"
-                stroke-dashoffset="414.69"/>
-              <defs>
-                <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                  <stop offset="0%" stop-color="#3d7a52"/>
-                  <stop offset="100%" stop-color="#7ec8a0"/>
-                </linearGradient>
-              </defs>
-            </svg>
-            <div class="ring-center">
-              <div class="ring-score" id="ringScore">0</div>
-              <div class="ring-label">/ 100</div>
+    <!-- Navbar -->
+    <div id="navbar">
+        <div id="nav-brand">
+            <div id="nav-brand-icon">🌿</div>
+            <div>
+                <div id="nav-brand-text">PhytoScan AI</div>
+                <div id="nav-brand-sub">Crop Health Dashboard</div>
             </div>
-          </div>
-          <div class="health-legend">
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#27ae60;"></div>
-              <div class="legend-label">Healthy</div>
-              <div class="legend-val">$healthy_scans</div>
+        </div>
+        <div id="nav-links">
+            <a href="http://localhost:7860" class="nav-btn">🏠 Home</a>
+            <a href="http://localhost:7861" class="nav-btn active">📊 Dashboard</a>
+            <a href="http://localhost:7860" class="nav-btn">🔬 Analyze</a>
+        </div>
+    </div>
+    
+    <!-- Hero Section -->
+    <div id="hero">
+        <div id="hero-title">📊 Crop Health Analytics Dashboard</div>
+        <div id="hero-sub">Comprehensive insights and visualizations from your plant scans history</div>
+        <div class="hero-stats">
+            <div class="hero-stat"><div class="hero-stat-num">{stats["total_scans"]}</div><div class="hero-stat-label">Total Scans</div></div>
+            <div class="hero-stat"><div class="hero-stat-num">{stats["unique_crops"]}</div><div class="hero-stat-label">Crops</div></div>
+            <div class="hero-stat"><div class="hero-stat-num">{stats["healthy_scans"]}</div><div class="hero-stat-label">Healthy</div></div>
+            <div class="hero-stat"><div class="hero-stat-num">{stats["critical_count"]}</div><div class="hero-stat-label">Critical</div></div>
+        </div>
+    </div>
+    
+    <!-- Main Content -->
+    <div id="main-content">
+        <!-- Stats Cards -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div style="font-size:32px;margin-bottom:8px;">📊</div>
+                <div style="font-size:28px;font-weight:800;color:#1b4332;">{stats["total_scans"]}</div>
+                <div style="font-size:13px;color:#6c757d;">Total Scans</div>
+                <div style="margin-top:8px;font-size:11px;color:#27ae60;">↑ All time</div>
             </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#f39c12;"></div>
-              <div class="legend-label">Warning</div>
-              <div class="legend-val">$warning_count</div>
+            <div class="stat-card">
+                <div style="font-size:32px;margin-bottom:8px;">🌾</div>
+                <div style="font-size:28px;font-weight:800;color:#1b4332;">{stats["unique_crops"]}</div>
+                <div style="font-size:13px;color:#6c757d;">Active Crops</div>
+                <div style="margin-top:8px;font-size:11px;color:#6c757d;">→ Monitored</div>
             </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#e74c3c;"></div>
-              <div class="legend-label">Critical</div>
-              <div class="legend-val">$critical_count</div>
+            <div class="stat-card">
+                <div style="font-size:32px;margin-bottom:8px;">✅</div>
+                <div style="font-size:28px;font-weight:800;color:#1b4332;">{stats["healthy_scans"]}</div>
+                <div style="font-size:13px;color:#6c757d;">Healthy Plants</div>
+                <div style="margin-top:8px;font-size:11px;color:#27ae60;">{stats['healthy_scans']/max(1,stats['total_scans'])*100:.0f}% of scans</div>
             </div>
-            <div class="legend-item">
-              <div class="legend-dot" style="background:#3498db;"></div>
-              <div class="legend-label">Recovering</div>
-              <div class="legend-val">0</div>
+            <div class="stat-card">
+                <div style="font-size:32px;margin-bottom:8px;">🦠</div>
+                <div style="font-size:28px;font-weight:800;color:#1b4332;">{stats["unique_diseases"]}</div>
+                <div style="font-size:13px;color:#6c757d;">Unique Diseases</div>
+                <div style="margin-top:8px;font-size:11px;color:#e74c3c;">Detected</div>
             </div>
-          </div>
         </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">🕐 Recent Scans</span>
-        <a class="card-action" onclick="showTab('scans', null)">View all →</a>
-      </div>
-      <div class="card-body" style="padding:0 0 4px;">
-        <table class="scan-table">
-          <thead>
-            <tr><th>Crop</th><th>Disease</th><th>Severity</th><th>Date</th> </tr>
-          </thead>
-          <tbody id="recentScansBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <div class="card anim anim-4">
-    <div class="card-header">
-      <span class="card-title">📅 Scan Frequency (Last 12 Weeks)</span>
-    </div>
-    <div class="card-body">
-      <div class="chart-wrap" style="height:180px;">
-        $freq_html
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Crops Tab -->
-<div class="tab-panel" id="tab-crops">
-  <div class="sec-label">🌾 My Crops</div>
-  <div class="sec-sub">Long-term maintenance tracker for all your active crops</div>
-  <div class="grid-3" id="cropGrid"></div>
-</div>
-
-<!-- Scan History Tab -->
-<div class="tab-panel" id="tab-scans">
-  <div class="sec-label">🔬 Full Scan History</div>
-  <div class="sec-sub">Every upload analyzed by PhytoScan AI</div>
-  <div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;align-items:center;">
-    <select id="filterCrop" style="padding:9px 14px;border:1px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:13px;color:var(--ink);background:var(--paper);cursor:pointer;" onchange="filterScans()">
-      <option value="">All Crops</option>
-      $crop_options
-    </select>
-    <select id="filterSev" style="padding:9px 14px;border:1px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:13px;color:var(--ink);background:var(--paper);cursor:pointer;" onchange="filterScans()">
-      <option value="">All Severity</option>
-      <option>High</option><option>Medium</option><option>Low</option><option>None</option>
-    </select>
-    <div style="margin-left:auto;font-size:13px;color:var(--muted);" id="scanCount">Showing $total_scans scans</div>
-  </div>
-  <div class="card">
-    <div class="card-body" style="padding:0 0 8px;">
-      <table class="scan-table" style="width:100%;">
-        <thead>
-          <tr><th>#</th><th>Date</th><th>Crop</th><th>Disease</th><th>Severity</th><th>Confidence</th><th>Action Taken</th> </tr>
-        </thead>
-        <tbody id="fullScansBody"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<!-- Progress Tab -->
-<div class="tab-panel" id="tab-progress">
-  <div class="sec-label">📈 Improvement Progress</div>
-  <div class="sec-sub">Track how your crops are recovering over time</div>
-  <div class="grid-2">
-    <div class="card">
-      <div class="card-header"><span class="card-title">📉 Disease Frequency Over Time</span></div>
-      <div class="card-body">
-        <div class="chart-wrap" style="height:240px;">
-          $progress_html
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><span class="card-title">🌡️ Crop Health Radar</span></div>
-      <div class="card-body">
-        <div class="chart-wrap" style="height:240px;">
-          $radar_html
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="card" style="margin-bottom:24px;">
-    <div class="card-header"><span class="card-title">🗓️ Improvement Timeline</span></div>
-    <div class="card-body">
-      <div class="timeline" id="progressTimeline"></div>
-    </div>
-  </div>
-  <div class="card">
-    <div class="card-header"><span class="card-title">🌾 Per-Crop Health Progress</span></div>
-    <div class="card-body" id="cropProgressBars"></div>
-  </div>
-</div>
-
-<!-- Alerts Tab -->
-<div class="tab-panel" id="tab-alerts">
-  <div class="sec-label">🚨 Active Alerts & Tasks</div>
-  <div class="sec-sub">Pending actions and maintenance reminders</div>
-  <div class="grid-2">
-    <div>
-      <div style="font-size:13px;font-weight:700;color:var(--danger);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">🔴 Urgent</div>
-      <div id="urgentAlerts"></div>
-      <div style="font-size:13px;font-weight:700;color:var(--warning);text-transform:uppercase;letter-spacing:1px;margin:20px 0 12px;">🟡 This Week</div>
-      <div id="weekAlerts"></div>
-    </div>
-    <div>
-      <div style="font-size:13px;font-weight:700;color:var(--info);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">🔵 Routine</div>
-      <div id="routineAlerts"></div>
-      <div style="font-size:13px;font-weight:700;color:var(--success);text-transform:uppercase;letter-spacing:1px;margin:20px 0 12px;">✅ Completed</div>
-      <div id="doneAlerts"></div>
-    </div>
-  </div>
-</div>
-
-<!-- Environment Tab -->
-<div class="tab-panel" id="tab-environment">
-  <div class="sec-label">🌡️ Environment & Soil Monitor</div>
-  <div class="sec-sub">Real-time conditions affecting your crop health</div>
-  <div class="grid-3">
-    <div class="card">
-      <div class="card-header"><span class="card-title">☁️ Today's Weather</span></div>
-      <div class="card-body">
-        <div class="weather-main">
-          <div class="weather-icon">⛅</div>
-          <div>
-            <div class="weather-temp">28°C</div>
-            <div class="weather-desc">Partly Cloudy · Bengaluru</div>
-          </div>
-        </div>
-        <div class="weather-grid">
-          <div class="weather-cell"><div class="weather-cell-label">Humidity</div><div class="weather-cell-val">72%</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Wind</div><div class="weather-cell-val">12 km/h</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">UV Index</div><div class="weather-cell-val">6 (High)</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Rainfall</div><div class="weather-cell-val">0 mm</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Dew Pt</div><div class="weather-cell-val">22°C</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Pressure</div><div class="weather-cell-val">1012 hPa</div></div>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><span class="card-title">🌍 Soil Conditions</span></div>
-      <div class="card-body" id="soilGauges"></div>
-    </div>
-    <div class="card">
-      <div class="card-header"><span class="card-title">💧 Irrigation Status</span></div>
-      <div class="card-body">
-        <div style="text-align:center;padding:12px 0;">
-          <div style="font-size:52px;">💧</div>
-          <div style="font-family:'Playfair Display',serif;font-size:28px;font-weight:900;color:var(--forest);margin-top:8px;">Last Watered</div>
-          <div style="font-size:20px;color:var(--fern);font-weight:700;margin-top:4px;">2 hours ago</div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px;">
-          <div class="weather-cell"><div class="weather-cell-label">Next Due</div><div class="weather-cell-val" style="font-size:13px;">Tomorrow 6AM</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Volume</div><div class="weather-cell-val">18 L/m²</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Method</div><div class="weather-cell-val">Drip</div></div>
-          <div class="weather-cell"><div class="weather-cell-label">Coverage</div><div class="weather-cell-val">94%</div></div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="card">
-    <div class="card-header"><span class="card-title">📅 7-Day Forecast & Crop Risk</span></div>
-    <div class="card-body">
-      <div class="chart-wrap" style="height:200px;">
-        $forecast_html
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Journal Tab -->
-<div class="tab-panel" id="tab-journal">
-  <div class="sec-label">📓 Field Journal</div>
-  <div class="sec-sub">Record observations, treatments, and notes for each crop</div>
-  <div class="grid-2">
-    <div>
-      <div id="notesList"></div>
-      <div class="note-input-wrap">
-        <div style="font-size:13px;font-weight:700;color:var(--forest);margin-bottom:8px;">+ Add New Entry</div>
-        <select id="noteCrop" style="width:100%;padding:9px 14px;border:1px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:13px;margin-bottom:8px;color:var(--ink);background:var(--paper);">
-          $crop_options
-        </select>
-        <textarea class="note-textarea" id="noteText" placeholder="Describe what you observed — symptoms, treatments applied, weather conditions, etc."></textarea>
-        <button class="note-submit" onclick="addNote()">📝 Save Entry</button>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><span class="card-title">📊 Journal Activity</span></div>
-      <div class="card-body">
-        <div class="chart-wrap" style="height:200px;">
-          $journal_html
-        </div>
-        <div style="margin-top:16px;">
-          <div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Most Logged Crops</div>
-          <div id="journalCropBars"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Quick Scan Tab -->
-<div class="tab-panel" id="tab-quickscan">
-  <div class="sec-label">📷 Quick Scan</div>
-  <div class="sec-sub">Upload a plant image for instant AI-powered disease detection</div>
-  <div class="grid-2">
-    <div class="card">
-      <div class="card-header"><span class="card-title">📤 Upload Image</span></div>
-      <div class="card-body">
-        <div class="upload-zone" id="dropZone">
-          <input type="file" accept="image/*" onchange="handleUpload(event)"/>
-          <div class="upload-icon">🌿</div>
-          <div class="upload-text">Drop your plant image here</div>
-          <div class="upload-sub">or click to browse · JPG, PNG, WEBP up to 10MB</div>
-        </div>
-        <div id="uploadPreview" style="display:none;margin-top:16px;text-align:center;">
-          <img id="previewImg" style="max-width:100%;max-height:220px;border-radius:12px;border:2px solid var(--border);"/>
-          <div style="margin-top:12px;">
-            <button class="note-submit" onclick="simulateScan()">🔍 Analyze Now</button>
-          </div>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px;">
-          <div style="background:var(--cream);border-radius:10px;padding:12px;text-align:center;">
-            <div style="font-size:22px;">⚡</div>
-            <div style="font-size:12px;font-weight:700;color:var(--forest);margin-top:4px;">Under 5 seconds</div>
-            <div style="font-size:11px;color:var(--muted);">AI Analysis Time</div>
-          </div>
-          <div style="background:var(--cream);border-radius:10px;padding:12px;text-align:center;">
-            <div style="font-size:22px;">🎯</div>
-            <div style="font-size:12px;font-weight:700;color:var(--forest);margin-top:4px;">95% Accuracy</div>
-            <div style="font-size:11px;color:var(--muted);">Disease Detection</div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><span class="card-title">📋 Scan Result</span></div>
-      <div class="card-body">
-        <div id="scanResult">
-          <div style="text-align:center;padding:40px 20px;color:var(--muted);">
-            <div style="font-size:52px;margin-bottom:12px;">🌿</div>
-            <div style="font-size:15px;font-weight:600;">Upload an image to see results</div>
-            <div style="font-size:12px;margin-top:6px;">AI will analyze your plant and generate a full report</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="card" style="margin-top:4px;">
-    <div class="card-header"><span class="card-title">💡 Tips for Best Results</span></div>
-    <div class="card-body">
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;">
-        <div style="display:flex;gap:10px;align-items:flex-start;">
-          <div style="font-size:22px;">☀️</div>
-          <div><div style="font-size:13px;font-weight:700;color:var(--ink);">Good Lighting</div><div style="font-size:12px;color:var(--muted);margin-top:2px;">Natural daylight gives best results; avoid harsh flash.</div></div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:flex-start;">
-          <div style="font-size:22px;">🎯</div>
-          <div><div style="font-size:13px;font-weight:700;color:var(--ink);">Focus on Symptoms</div><div style="font-size:12px;color:var(--muted);margin-top:2px;">Zoom in on discolored, spotted, or wilted areas.</div></div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:flex-start;">
-          <div style="font-size:22px;">🌿</div>
-          <div><div style="font-size:13px;font-weight:700;color:var(--ink);">Multiple Angles</div><div style="font-size:12px;color:var(--muted);margin-top:2px;">Scan different leaves for consistent diagnosis.</div></div>
-        </div>
-        <div style="display:flex;gap:10px;align-items:flex-start;">
-          <div style="font-size:22px;">📏</div>
-          <div><div style="font-size:13px;font-weight:700;color:var(--ink);">Include Scale</div><div style="font-size:12px;color:var(--muted);margin-top:2px;">A coin or ruler helps the AI judge lesion size.</div></div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-</main>
-
-<script>
-// ==================== DATA FROM PYTHON ====================
-const scanData = $scan_list_json;
-const cropData = $crops_json;
-const alertData = $alerts_json;
-const noteData = $notes_json;
-const soilGaugesData = $soil_gauges_json;
-const progressTimelineData = $progress_timeline_json;
-
-// ==================== RENDER FUNCTIONS ====================
-function severityTag(sev) {
-  const map = { 'High':'tag-danger', 'Medium':'tag-warning', 'Low':'tag-success', 'None':'tag-info' };
-  const dot = { 'High':'#e74c3c', 'Medium':'#f39c12', 'Low':'#27ae60', 'None':'#3498db' };
-  const cls = map[sev] || 'tag-info';
-  return `<span class="disease-tag ${cls}"><span class="sev-dot" style="background:${dot[sev]||'#999'};"></span>${sev}</span>`;
-}
-
-function diseaseTag(d) {
-  const healthy = d.toLowerCase().includes('healthy');
-  return `<span class="disease-tag ${healthy ? 'tag-success' : 'tag-danger'}">${healthy ? '✅' : '🦠'} ${d}</span>`;
-}
-
-function renderRecentScans() {
-  const body = document.getElementById('recentScansBody');
-  body.innerHTML = scanData.slice(0,6).map(s => `
-    <tr>
-      <td><b>${s.crop}</b></td>
-      <td>${diseaseTag(s.disease)}</td>
-      <td>${severityTag(s.severity)}</td>
-      <td style="color:var(--muted);font-size:12px;">${s.date}</td>
-    </tr>`).join('');
-}
-
-function renderFullScans() {
-  const body = document.getElementById('fullScansBody');
-  body.innerHTML = scanData.map(s => `
-    <tr>
-      <td style="color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:11px;">#${String(s.id).padStart(3,'0')}</td>
-      <td style="font-size:12px;color:var(--muted);">${s.date}</td>
-      <td><b>${s.crop}</b></td>
-      <td>${diseaseTag(s.disease)}</td>
-      <td>${severityTag(s.severity)}</td>
-      <td>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <div style="flex:1;background:var(--border);border-radius:4px;height:5px;overflow:hidden;max-width:60px;">
-            <div style="height:100%;border-radius:4px;background:linear-gradient(90deg,var(--fern),var(--mint));width:${s.confidence}%;"></div>
-          </div>
-          <span style="font-size:11px;font-weight:700;color:var(--fern);">${s.confidence}%</span>
-        </div>
-      </td>
-      <td style="font-size:12px;color:var(--muted);">${s.action}</td>
-    </tr>`).join('');
-}
-
-function filterScans() {
-  const crop = document.getElementById('filterCrop').value;
-  const sev = document.getElementById('filterSev').value;
-  const filtered = scanData.filter(s =>
-    (!crop || s.crop === crop) && (!sev || s.severity === sev));
-  document.getElementById('scanCount').textContent = `Showing ${filtered.length} scans`;
-  document.getElementById('fullScansBody').innerHTML = filtered.map(s => `
-    <tr>
-      <td style="color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:11px;">#${String(s.id).padStart(3,'0')}</td>
-      <td style="font-size:12px;color:var(--muted);">${s.date}</td>
-      <td><b>${s.crop}</b></td>
-      <td>${diseaseTag(s.disease)}</td>
-      <td>${severityTag(s.severity)}</td>
-      <td><span style="font-size:11px;font-weight:700;color:var(--fern);">${s.confidence}%</span></td>
-      <td style="font-size:12px;color:var(--muted);">${s.action}</td>
-    </tr>`).join('');
-}
-
-function renderCrops() {
-  const healthColor = h => h >= 80 ? '#27ae60' : h >= 60 ? '#f39c12' : '#e74c3c';
-  const statusBadge = s => ({'Good':'tag-success','Warning':'tag-warning','Critical':'tag-danger'}[s]||'tag-info');
-  document.getElementById('cropGrid').innerHTML = cropData.map(c => `
-    <div class="crop-card">
-      <div class="crop-card-top" data-emoji="${c.emoji}">
-        <div style="display:flex;align-items:center;justify-content:space-between;">
-          <div>
-            <div class="crop-name">${c.name}</div>
-            <div class="crop-variety">${c.variety}</div>
-          </div>
-          <span class="disease-tag ${statusBadge(c.status)}" style="font-size:10px;">${c.status}</span>
-        </div>
-        <div class="crop-health-bar">
-          <div class="crop-health-fill" style="width:${c.health}%;background:${healthColor(c.health)};"></div>
-        </div>
-        <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:rgba(255,255,255,0.6);">
-          <span>Health</span><span style="font-weight:700;color:#fff;">${c.health}%</span>
-        </div>
-      </div>
-      <div class="crop-card-body">
-        <div class="crop-meta">
-          <div class="crop-meta-item"><div class="crop-meta-label">Planted</div><div class="crop-meta-val" style="font-size:12px;">${c.planted}</div></div>
-          <div class="crop-meta-item"><div class="crop-meta-label">Area</div><div class="crop-meta-val" style="font-size:12px;">${c.area}</div></div>
-          <div class="crop-meta-item"><div class="crop-meta-label">Total Scans</div><div class="crop-meta-val">${c.scans}</div></div>
-          <div class="crop-meta-item"><div class="crop-meta-label">Next Action</div><div class="crop-meta-val" style="font-size:12px;">${c.nextAction}</div></div>
-        </div>
-      </div>
-      <div class="crop-actions">
-        <button class="crop-btn">📊 History</button>
-        <button class="crop-btn">📓 Notes</button>
-        <button class="crop-btn primary-btn" onclick="showTab('quickscan',null)">🔬 Scan</button>
-      </div>
-    </div>`).join('');
-}
-
-function renderAlerts() {
-  const renderGroup = (items, type) => items.map(a => `
-    <div class="alert-item ${type}">
-      <div class="alert-icon"><span>${a.icon}</span></div>
-      <div style="flex:1;">
-        <div class="alert-title">${a.title}</div>
-        <div class="alert-desc">${a.desc}</div>
-      </div>
-      <div class="alert-time">${a.time}</div>
-    </div>`).join('');
-  document.getElementById('urgentAlerts').innerHTML  = renderGroup(alertData.urgent,'urgent');
-  document.getElementById('weekAlerts').innerHTML    = renderGroup(alertData.week,'warning');
-  document.getElementById('routineAlerts').innerHTML = renderGroup(alertData.routine,'info');
-  document.getElementById('doneAlerts').innerHTML    = renderGroup(alertData.done,'done');
-}
-
-function renderSoilGauges() {
-  document.getElementById('soilGauges').innerHTML = soilGaugesData.map(i => `
-    <div class="env-gauge">
-      <div class="env-icon">${i.icon}</div>
-      <div class="env-info"><div class="env-name">${i.name}</div><div class="env-val">${i.val}</div></div>
-      <div class="env-bar">
-        <div class="env-track">
-          <div class="env-fill" style="width:${i.pct}%;background:${i.color};"></div>
-        </div>
-      </div>
-      <div class="env-pct">${i.pct}%</div>
-    </div>`).join('');
-}
-
-function renderProgressTimeline() {
-  document.getElementById('progressTimeline').innerHTML = progressTimelineData.map(i => `
-    <div class="tl-item">
-      <div class="tl-dot ${i.cls}">✦</div>
-      <div class="tl-date">${i.date}</div>
-      <div class="tl-title">${i.title}</div>
-      <div class="tl-body">${i.body}</div>
-      <span class="tl-tag ${i.tagCls}">${i.tag}</span>
-    </div>`).join('');
-}
-
-function renderCropProgressBars() {
-  const progress = cropData.map(c => ({
-    name: c.name,
-    before: Math.max(0, c.health - 10),
-    after: c.health,
-    color: c.health >= 80 ? '#27ae60' : c.health >= 60 ? '#f39c12' : '#e74c3c'
-  }));
-  document.getElementById('cropProgressBars').innerHTML = progress.map(d => `
-    <div style="margin-bottom:18px;">
-      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-        <span style="font-size:13px;font-weight:600;">${d.name}</span>
-        <span style="font-size:12px;color:var(--muted);">${d.before}% → <b style="color:var(--fern);">${d.after}%</b></span>
-      </div>
-      <div style="position:relative;background:var(--border);border-radius:6px;height:10px;overflow:hidden;">
-        <div style="position:absolute;left:0;top:0;height:100%;width:${d.before}%;background:#ddd;border-radius:6px;"></div>
-        <div style="position:absolute;left:0;top:0;height:100%;width:${d.after}%;background:linear-gradient(90deg,${d.color},${d.color}99);border-radius:6px;transition:width 1s ease;"></div>
-      </div>
-      <div style="font-size:11px;color:var(--success);margin-top:4px;">↑ +${d.after - d.before}% improvement</div>
-    </div>`).join('');
-}
-
-function renderNotes() {
-  document.getElementById('notesList').innerHTML = noteData.map(n => `
-    <div class="note-item">
-      <div class="note-header">
-        <span class="note-crop">🌿 ${n.crop}</span>
-        <span class="note-date">${n.date}</span>
-      </div>
-      <div class="note-text">${n.text}</div>
-    </div>`).join('');
-}
-
-function renderJournalCropBars() {
-  const counts = {};
-  noteData.forEach(n => { counts[n.crop] = (counts[n.crop] || 0) + 1; });
-  const items = Object.entries(counts).map(([crop, count]) => ({ crop, count })).sort((a,b) => b.count - a.count);
-  const max = Math.max(...items.map(c => c.count));
-  document.getElementById('journalCropBars').innerHTML = items.map(c => `
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
-      <div style="font-size:12px;min-width:80px;">🌿 ${c.crop}</div>
-      <div style="flex:1;background:var(--border);border-radius:4px;height:6px;overflow:hidden;">
-        <div style="height:100%;border-radius:4px;background:linear-gradient(90deg,var(--fern),var(--mint));width:${(c.count/max)*100}%;"></div>
-      </div>
-      <div style="font-size:12px;font-weight:700;color:var(--fern);min-width:20px;">${c.count}</div>
-    </div>`).join('');
-}
-
-function addNote() {
-  const crop = document.getElementById('noteCrop').value;
-  const text = document.getElementById('noteText').value.trim();
-  if (!text) return;
-  const today = new Date().toLocaleDateString('en-US', { month:'short', day:'numeric' });
-  noteData.unshift({ crop, date: today, text });
-  renderNotes();
-  document.getElementById('noteText').value = '';
-}
-
-// Tab system
-const tabTitles = {
-  overview:'Dashboard', crops:'My Crops', scans:'Scan History',
-  progress:'Progress', alerts:'Alerts', environment:'Environment',
-  journal:'Field Journal', quickscan:'Quick Scan'
-};
-
-function showTab(name, navEl) {
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  const panel = document.getElementById('tab-' + name);
-  if (panel) panel.classList.add('active');
-  if (navEl) navEl.classList.add('active');
-  document.getElementById('page-title').textContent = tabTitles[name] || name;
-  document.getElementById('page-breadcrumb').textContent = `PhytoScan AI / ${tabTitles[name] || name}`;
-  if (window.innerWidth <= 900) closeSidebar();
-}
-
-function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('open');
-  document.getElementById('overlay').classList.toggle('show');
-}
-function closeSidebar() {
-  document.getElementById('sidebar').classList.remove('open');
-  document.getElementById('overlay').classList.remove('show');
-}
-
-// Export
-function exportData() {
-  const csv = ['Date,Crop,Disease,Severity,Confidence,Action']
-    .concat(scanData.map(s => `${s.date},${s.crop},${s.disease},${s.severity},${s.confidence}%,${s.action}`))
-    .join('\\n');
-  const blob = new Blob([csv], { type:'text/csv' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'phytoscan_export.csv';
-  a.click();
-}
-
-// Quick scan simulation
-function handleUpload(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    document.getElementById('previewImg').src = ev.target.result;
-    document.getElementById('uploadPreview').style.display = 'block';
-  };
-  reader.readAsDataURL(file);
-}
-
-function simulateScan() {
-  document.getElementById('scanResult').innerHTML = `
-    <div style="text-align:center;padding:30px;">
-      <div style="font-size:42px;animation:spin 1s linear infinite;display:inline-block;">🔬</div>
-      <div style="font-size:14px;font-weight:600;color:var(--forest);margin-top:12px;">Analyzing with Gemini AI...</div>
-    </div>
-    <style>@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}</style>`;
-  setTimeout(() => {
-    document.getElementById('scanResult').innerHTML = `
-      <div style="padding:4px;">
-        <div style="background:linear-gradient(135deg,rgba(231,76,60,0.08),rgba(231,76,60,0.02));
-                    border:1.5px solid rgba(231,76,60,0.3);border-radius:12px;padding:16px 18px;margin-bottom:14px;">
-          <div style="font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:#888;margin-bottom:4px;">Diagnosis</div>
-          <div style="font-size:20px;font-weight:800;color:#1a1a2e;">🦠 Leaf Spot Disease</div>
-          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
-            <span class="disease-tag tag-warning">⚡ Medium Severity</span>
-            <span class="disease-tag tag-danger">🕐 Soon Action</span>
-          </div>
-          <div style="margin-top:12px;">
-            <div style="display:flex;justify-content:space-between;font-size:11px;color:#888;margin-bottom:4px;">
-              <span>AI Confidence</span><span style="font-weight:700;color:#e74c3c;">88%</span>
+        
+        <!-- Charts -->
+        <div class="charts-grid">
+            <div class="card">
+                {health_html}
             </div>
-            <div style="background:#e8e8e8;border-radius:6px;height:7px;overflow:hidden;">
-              <div style="background:linear-gradient(90deg,#e74c3c,#f1948a);width:88%;height:100%;border-radius:6px;"></div>
+            <div class="card">
+                {gauge_html}
             </div>
-          </div>
         </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px;">
-          <div style="background:#f8f9ff;border-radius:10px;padding:12px;text-align:center;"><div style="font-size:20px;">🍃</div><div style="font-size:10px;color:#888;">Affected</div><div style="font-size:12px;font-weight:700;">Leaves</div></div>
-          <div style="background:#f8fff8;border-radius:10px;padding:12px;text-align:center;"><div style="font-size:20px;">🔬</div><div style="font-size:10px;color:#888;">Cause</div><div style="font-size:12px;font-weight:700;">Fungal</div></div>
-          <div style="background:#fff8f8;border-radius:10px;padding:12px;text-align:center;"><div style="font-size:20px;">📊</div><div style="font-size:10px;color:#888;">Confidence</div><div style="font-size:12px;font-weight:700;">88%</div></div>
+        
+        <div class="charts-grid">
+            <div class="card">
+                {disease_html}
+            </div>
+            <div class="card">
+                {severity_html}
+            </div>
         </div>
-        <div style="background:#fffbf0;border-left:3px solid #f39c12;border-radius:0 10px 10px 0;padding:12px 14px;margin-bottom:10px;">
-          <div style="font-size:10px;font-weight:700;color:#f39c12;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">💊 Treatment</div>
-          <div style="font-size:13px;color:#555;line-height:1.5;">Remove affected leaves. Apply mancozeb or copper-based fungicide. Avoid overhead irrigation.</div>
+        
+        <div class="charts-grid">
+            <div class="card">
+                {activity_html}
+            </div>
+            <div class="card">
+                <div style="height:280px;display:flex;align-items:center;justify-content:center;">
+                    <div style="text-align:center;">
+                        <div style="font-size:48px;margin-bottom:16px;">🌿</div>
+                        <div style="font-size:14px;color:#1b4332;font-weight:600;">AI-Powered Insights</div>
+                        <div style="font-size:12px;color:#6c757d;margin-top:8px;">Real-time crop health monitoring</div>
+                    </div>
+                </div>
+            </div>
         </div>
-        <div style="background:#f0fff4;border-left:3px solid #27ae60;border-radius:0 10px 10px 0;padding:12px 14px;">
-          <div style="font-size:10px;font-weight:700;color:#27ae60;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🛡️ Prevention</div>
-          <div style="font-size:13px;color:#555;line-height:1.5;">Improve air circulation, avoid wetting foliage. Rotate crops annually.</div>
+        
+        <!-- Crop Cards -->
+        <div class="section-title">🌱 Active Crops</div>
+        <div class="section-sub">Health status and monitoring history</div>
+        <div class="crops-grid">
+            {crop_cards_html}
         </div>
-        <div style="text-align:center;margin-top:12px;">
-          <button class="note-submit" onclick="showTab('scans',null)">View in History</button>
+        
+        <!-- Alerts Section -->
+        <div class="section-title">🚨 Active Alerts</div>
+        <div class="section-sub">Critical issues requiring immediate attention</div>
+        <div class="card">
+            {alerts_html}
         </div>
-      </div>`;
-  }, 2200);
-}
-
-// Health ring animation
-function animateRing(score) {
-  const circ = 2 * Math.PI * 66;
-  const ring = document.getElementById('healthRing');
-  const scoreEl = document.getElementById('ringScore');
-  const offset = circ * (1 - score / 100);
-  setTimeout(() => { ring.style.strokeDashoffset = offset; }, 300);
-  let cur = 0;
-  const timer = setInterval(() => {
-    cur = Math.min(cur + 2, score);
-    scoreEl.textContent = cur;
-    if (cur >= score) clearInterval(timer);
-  }, 20);
-}
-
-// Initialize
-document.addEventListener('DOMContentLoaded', () => {
-  renderRecentScans();
-  renderFullScans();
-  renderCrops();
-  renderAlerts();
-  renderSoilGauges();
-  renderProgressTimeline();
-  renderCropProgressBars();
-  renderNotes();
-  renderJournalCropBars();
-  animateRing($health_trend_last);
-});
-</script>
+        
+        <!-- Recent Scans -->
+        <div class="section-title">📋 Recent Scans</div>
+        <div class="section-sub">Latest plant health analyses</div>
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table class="scan-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Crop</th>
+                        <th>Disease</th>
+                        <th>Status</th>
+                        <th>Confidence</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {recent_scans_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <!-- Footer -->
+    <div id="footer">
+        <div class="footer-grid">
+            <div class="footer-brand">
+                <h3>🌿 PhytoScan AI</h3>
+                <p>AI-powered plant disease detection for farmers, gardeners, and agronomists. Protecting crops through intelligent technology.</p>
+            </div>
+            <div class="footer-col">
+                <h4>Features</h4>
+                <ul>
+                    <li>🔬 Disease Detection</li>
+                    <li>💊 Treatment Guide</li>
+                    <li>🛡️ Prevention Tips</li>
+                    <li>📊 Analytics Dashboard</li>
+                </ul>
+            </div>
+            <div class="footer-col">
+                <h4>Crops Supported</h4>
+                <ul>
+                    <li>🍅 Tomato</li>
+                    <li>🌽 Corn / Maize</li>
+                    <li>🥔 Potato</li>
+                    <li>🌾 Wheat & Rice</li>
+                    <li>🫑 Pepper & more</li>
+                </ul>
+            </div>
+            <div class="footer-col">
+                <h4>Powered By</h4>
+                <ul>
+                    <li>🤖 Google Gemini 2.5 Flash</li>
+                    <li>🎨 Plotly & Gradio</li>
+                    <li>🐍 Python</li>
+                    <li>🔑 Google AI Studio</li>
+                </ul>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <div>© 2026 PhytoScan AI · Built for smarter farming 🌾</div>
+            <div class="footer-badges">
+                <div class="footer-badge">🆓 Free to Use</div>
+                <div class="footer-badge">🔒 Privacy First</div>
+                <div class="footer-badge">⚡ Real-time Analytics</div>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
-    """)
+    """
+    
+    return html
 
-    # Prepare substitution dictionary
-    subs = {
-        "scan_list_json": scan_list_json,
-        "crops_json": crops_json,
-        "alerts_json": alerts_json,
-        "notes_json": notes_json,
-        "soil_gauges_json": soil_gauges_json,
-        "progress_timeline_json": progress_timeline_json,
-        "total_scans": total_scans,
-        "unique_diseases": unique_diseases,
-        "unique_diseases_diff": max(0, unique_diseases - 2),
-        "len(crops)": len(crops),
-        "alert_count": len(alerts.get("urgent", [])) + len(alerts.get("week", [])),
-        "health_trend_last": health_trend_last,
-        "health_improvement": int(
-            health_trend_last - (health_trend[0] if health_trend else 70)
-        ),
-        "healthy_scans": healthy_scans,
-        "warning_count": severity_counts.get("Medium", 0),
-        "critical_count": severity_counts.get("High", 0),
-        "health_html": health_html,
-        "disease_html": disease_html,
-        "freq_html": freq_html,
-        "progress_html": progress_html,
-        "radar_html": radar_html,
-        "forecast_html": forecast_html,
-        "journal_html": journal_html,
-        "crop_options": "".join(f"<option>{c['name']}</option>" for c in crops),
-    }
-
-    # Substitute and return
-    return template.substitute(subs)
-
-
-# The rest of the helper functions (extract_crop_from_image, generate_action, get_crop_emoji, compute_health_trend, compute_frequency, compute_progress_timeline, compute_radar_data, compute_crop_progress, generate_alerts, and all Plotly chart functions) remain exactly as in the previous code.
-# I'm omitting them here for brevity, but they should be included in the final file.
-
-def generate_alerts(scan_list):
-    alerts = []
-    for s in scan_list:
-        if s["severity"] in ["High", "Medium"]:
-            alerts.append({
-                "type": "warning" if s["severity"] == "Medium" else "danger",
-                "message": f"{s['disease']} detected in {s['crop']}",
-                "time": s["date"]
-            })
-    return alerts
-
-def extract_crop_from_image(image_path):
-    # Simple heuristic to extract crop from filename
-    if "tomato" in image_path.lower():
-        return "Tomato"
-    elif "potato" in image_path.lower():
-        return "Potato"
-    elif "corn" in image_path.lower():
-        return "Corn"
-    else:
-        return "Unknown"
-
-def generate_action(disease, severity):
-    if disease == "None":
-        return "No action needed"
-    elif severity == "High":
-        return "Immediate treatment required"
-    elif severity == "Medium":
-        return "Monitor and treat if necessary"
-    else:
-        return "Observe"
-
-def get_crop_emoji(crop):
-    emojis = {"Tomato": "🍅", "Potato": "🥔", "Corn": "🌽"}
-    return emojis.get(crop, "🌱")
-
-def compute_health_trend(scan_list):
-    # Mock data
-    return [70, 75, 80, 85]
-
-def compute_frequency(scan_list):
-    # Mock data
-    return [("Week 1", 5), ("Week 2", 7), ("Week 3", 3)]
-
-def compute_progress_timeline(scan_list):
-    # Mock data
-    return [{"date": "2023-01-01", "event": "Scan 1"}, {"date": "2023-01-15", "event": "Scan 2"}]
-
-def compute_radar_data(scan_list, crops):
-    # Mock data
-    return {"health": 80, "yield": 70, "resistance": 60}
-
-def compute_crop_progress(scan_list, crops):
-    # Mock data
-    return [{"crop": "Tomato", "progress": 75}]
-
-# Plotly chart functions
-import plotly.express as px
-
-def create_health_chart(health_trend):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=list(range(len(health_trend))), y=health_trend, mode='lines+markers'))
-    fig.update_layout(title="Health Trend")
-    return fig
-
-def create_disease_chart(disease_counts):
-    fig = px.bar(x=list(disease_counts.keys()), y=list(disease_counts.values()))
-    return fig
-
-def create_freq_chart(freq_data):
-    fig = px.line(x=[x[0] for x in freq_data], y=[x[1] for x in freq_data])
-    return fig
-
-def create_progress_chart(timeline):
-    fig = go.Figure()
-    # Add timeline
-    return fig
-
-def create_radar_chart(radar_data):
-    fig = go.Figure()
-    # Add radar
-    return fig
-
-def create_forecast_chart():
-    fig = go.Figure()
-    return fig
-
-def create_journal_chart(notes):
-    fig = go.Figure()
-    return fig
-
-def build_dashboard():
-    return gr.HTML(generate_dashboard_html())
-
-
-
-with gr.Blocks(title="PhytoScan AI Dashboard") as dashboard:
-    gr.HTML(build_dashboard())
-
+# ─── Gradio App ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    dashboard.launch(debug=True)
+    custom_css = """
+    .gradio-container {
+        max-width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    footer {
+        display: none !important;
+    }
+    """
+    
+    # For Gradio 6.0+, move css to launch() instead of Blocks constructor
+    with gr.Blocks(title="PhytoScan AI Dashboard") as demo:
+        gr.HTML(build_dashboard_html())
+    
+    demo.launch(server_port=7861, debug=True, share=False, css=custom_css)

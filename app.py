@@ -6,9 +6,12 @@ import os
 import mimetypes
 import json
 from datetime import datetime
+import pickle
 
 load_dotenv()
-generativeai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+_api_key = os.getenv("GOOGLE_API_KEY") or ""
+if _api_key.strip():
+    generativeai.configure(api_key=_api_key.strip())
 
 safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -17,18 +20,45 @@ safety_settings = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 
-model = generativeai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    safety_settings=safety_settings,
-    generation_config={
-        "temperature": 0.4,
-        "top_p": 1,
-        "top_k": 32,
-        "max_output_tokens": 4096,
-    }
-)
+model = None
+if _api_key.strip():
+    model = generativeai.GenerativeModel(
+        model_name="gemini-2.5-flash",
+        safety_settings=safety_settings,
+        generation_config={
+            "temperature": 0.4,
+            "top_p": 1,
+            "top_k": 32,
+            "max_output_tokens": 4096,
+        },
+    )
 
 scan_history = []
+HISTORY_FILE = "scan_history.pkl"
+
+
+def _load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "rb") as f:
+                data = pickle.load(f)
+                if isinstance(data, list):
+                    scan_history.extend(data)
+        except Exception:
+            # Ignore corrupted history and start fresh
+            pass
+
+
+def _save_history():
+    try:
+        with open(HISTORY_FILE, "wb") as f:
+            pickle.dump(scan_history, f)
+    except Exception:
+        # Persisting history is non‑critical; ignore failures
+        pass
+
+
+_load_history()
 
 def read_image_data(file_path):
     image_path = Path(file_path)
@@ -59,6 +89,20 @@ def analyze_plant(image_file):
         return None, build_empty_result(), build_history_html()
 
     try:
+        if model is None:
+            return (
+                None,
+                """
+                <div style="padding:20px;color:#8a6d3b;background:#fff8e1;border-radius:12px;border-left:4px solid #f39c12;">
+                    <b>⚠️ AI is not configured.</b><br><br>
+                    Set <code>GOOGLE_API_KEY</code> in your <code>.env</code> file (project root), then restart the app.<br>
+                    <div style="margin-top:10px;font-size:12px;color:#9a9a9a;">
+                      Tip: if your key was blocked as leaked, you must create a new one in Google AI Studio.
+                    </div>
+                </div>
+                """,
+                build_history_html(),
+            )
         file_path = image_file if isinstance(image_file, str) else image_file.name
         image_data = read_image_data(file_path)
         response = model.generate_content([input_prompt, image_data])
@@ -81,6 +125,7 @@ def analyze_plant(image_file):
             "date": datetime.now().strftime("%b %d, %Y %H:%M"),
             "cause": data.get("cause", "Unknown"),
         })
+        _save_history()
 
         return file_path, build_result_html(data), build_history_html()
 
@@ -654,7 +699,7 @@ NAVBAR_HTML = """
     </div>
   </div>
   <div id="nav-links">
-    <a href="app.py">
+    <a href="http://localhost:7860">
       <button class="nav-btn active">🏠 Home</button>
     </a>
 
@@ -662,7 +707,7 @@ NAVBAR_HTML = """
         <button class="nav-btn">🔬 Analyze</button>
     </a>
 
-    <a href="dashboard.py">
+    <a href="http://localhost:7861">
         <button class="nav-btn">📊 Dashboard</button>
     </a>
 
